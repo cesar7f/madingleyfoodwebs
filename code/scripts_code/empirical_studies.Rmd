@@ -1,0 +1,293 @@
+---
+title: "Empirical Studies"
+output:
+  html_document:
+    df_print: paged
+---
+
+This R notebook represents a script for plotting figures comparing *Madingley aggregated networks vs empirical studies*. Let's start by loading all the libraries that are required for running the rest of the notebook and the main parameters of the simulation:
+
+```{r, message=FALSE, warning=FALSE}
+# Loading packages
+library(igraph) # R famous graph library
+library(data.table) # A really fast data frame
+library(ggplot2) # Nice plots in R
+library(gridExtra) 
+library(NetIndices)
+library(parallel)
+library(latex2exp)
+
+# Loading Mandingley reading functions
+source('../main_code/network_reading.R')
+source('../main_code/network_aggregation.R')
+source('../main_code/network_sampling.R')
+source('../main_code/network_functions.R')
+source('../main_code/misc.R')
+```
+
+The followin represents the main parameters of the simulation:
+
+```{r}
+# Link attribute to be used as the weight in the network to perform the poisson sampling
+simulation_attr_weight     <- "biomass.flow"
+
+# Number of Madingley sampling networks for each empirical study
+simulation_sampling_trials <- 1000
+
+# Plot null model data
+simulation_use_null_model       <- FALSE
+
+# Use parallelism (only possible in non windows computers)
+simulation_use_parallelism      <- FALSE
+simulation_cores                <- 6 # If previous value is TRUE
+
+# Just a simple function to make use of a paraller lapply when enabled
+sim_lapply <- function(...){
+  if(simulation_use_parallelism == TRUE){
+    mclapply(mc.cores = simulation_cores, mc.silent = FALSE, ...)
+  } else{
+    lapply(...)
+  }
+}
+
+set.seed(101) ## for reproducibility
+```
+
+
+
+### Loading empirical studies
+Now, let's load all the matrices from empirical data into tables, following by the calculation of food web metrics into a final data table.
+```{r, message=FALSE, warning=FALSE}
+# Loading network empirical data into data table objects.
+filenames <- list.files("../../data/empirial_data/brose_webs", pattern="*.csv", full.names=TRUE)
+foodwebs <- lapply(filenames, read.table, header=TRUE, sep=",", col.names=c("pred","prey"))
+foodwebs <- lapply(foodwebs, function(df) {
+  df[,c("prey","pred")]
+})
+
+# applying all graph metrics to all empirical studies
+empirical_graphs <- lapply(foodwebs,graph.data.frame)
+empirical_metrics <- lapply(empirical_graphs,calculateGraphMetrics)
+empirical_metrics_dt <- rbindlist(empirical_metrics, fill=TRUE)
+#empirical_metrics_dt$file_name <- unlist(lapply(filenames, function(x) unlist(strsplit(x,'/'))[6]))
+empirical_metrics_dt
+```
+
+### Loading Madingley data
+Let's continue by loading the full Madingley network at different time steps (an snapshot of the simulation), from 1200 to 1223 (around ~1000 time steps are required for the simulation to become stable):
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+node_file <- '../../data/madingley_data/original_nodes.txt'
+edge_file <- '../../data/madingley_data/original_edges.txt'
+
+# 1200 to 1223
+madingley_times <- unique(fread(input=node_file, header = T, sep = '\t')$TimeStep)
+
+# Getting all mandingley objects (24 objects), each one representing a different time step and containing a different graph
+madingley_full_objects <- sim_lapply(madingley_times,  read.madingley.data, file_nodes=node_file, file_edges=edge_file, include_source_node = FALSE)
+```
+
+
+### Generating the cohort aggregation and link sampling of Madingley networks
+
+Comparing the previous output with empirical studies will be a little bit hard, in the sense that the size of the Madingley network is in average around 10 times larger than empirical studies in question (1000 vs 106.25). Therefore, in order to compare at around the same scala size, Madingley outpus need first to be aggregated and sampled according to the empirical study in question. So, for this part, for each study with $S$ nodes and $L$ links we: 
+
+* Aggregate the Madingley network into $S$ nodes
+* The resulting aggregated links (>$L$) are resampled using a poisson process (see main document for details), such that we end up with a stochastic network where the expected number of links is $L$.
+
+The next function reproduces the previous process given $S$ and $L$ and other paramters:
+```{r, message=FALSE, warning=FALSE}
+# Creates a random graph with S nodes and L expected links. 
+agg_sample_graph <- function(madingley_object, S, L, node_aggregation_function, link_weight = "biomass.flow") {
+  
+  agg_graph <- cohort.aggregation(madingley_object,S,node_aggregation_function)@G
+  sample_graph <- sampling.poisson(n_links_sampled = L, G = agg_graph, lambda_rate = link_weight)
+    
+  return(sample_graph)
+}
+```
+
+With some additional functions we will be able to create a set of $N$ Madingley aggregated sample food webs by study:
+```{r, message=FALSE, warning=FALSE}
+# Creates N_trials random graphs with S nodes and L expected links. 
+agg_sample_graphs <- function(N_trials, S, L, node_aggregation_function, link_weight = "biomass.flow") {
+  
+  snapshot_index = sample.int(length(madingley_times), N_trials, replace = TRUE)
+  
+  sample_graphs <- lapply(snapshot_index, function(x) agg_sample_graph(madingley_full_objects[[x]], S, L, node_aggregation_function))
+  
+  return(sample_graphs)
+}
+```
+
+### Extracting the network metrics for the Madingley aggregated sampled food webs
+
+We can extract now create a final function that will extract all metrics for all aggregated madingley food webs for each study. It will be also interesting to compare with a simple null model. The following functions generate metrics for both the Madingley food webs and a simple null model:
+
+```{r, message=FALSE, warning=FALSE}
+get_madingley_metrics <- function(N_trials, node_aggregation_function, link_weight = simulation_attr_weight)
+{
+  
+  # Creates a random graph with S nodes and L expected links. 
+  N <- N_trials # Number of Madingley food webs by study
+  i <- 0
+  get_metric_summary <- function(row) {
+    i <<- i+1
+    print(paste("Calculating metrics for network:", i))
+    graphs <- agg_sample_graphs(N, row$S, row$L, node_aggregation_function, link_weight)
+    metrics <- lapply(graphs,calculateGraphMetrics)
+    metrics_dt <- rbindlist(metrics, fill=TRUE)
+    return(metrics_dt)
+  }
+  
+  metrics <- sim_lapply(split(empirical_metrics_dt, seq(nrow(empirical_metrics_dt))), get_metric_summary)
+  return(metrics)
+}
+
+# metrics for a bernoulli null model
+get_null_metrics <- function(N_trials){
+   
+  i <- 0
+  get_metric_summary <- function(row) {
+    i <<- i+1
+    print(paste("Calculating metrics for network:", i))
+    graphs <- replicate(N_trials, list(null_bernoulli_graph(row$S,row$L)))
+    metrics <- lapply(graphs,calculateGraphMetrics)
+    metrics_dt <- rbindlist(metrics, fill=TRUE)
+    return(metrics_dt)
+  }
+  
+  metrics <- sim_lapply(split(empirical_metrics_dt, seq(nrow(empirical_metrics_dt))), get_metric_summary)
+  return(metrics)
+}
+```
+
+
+Using the previous function we can finally extract all network metrics for the Madingley aggregated sampled food webs. For this part, we will extract results for both methods of cohort aggregation: i) jaccard trophic similarity, and k-means mass aggregation:
+
+```{r, message=FALSE, warning=FALSE}
+# this part is very expensive, therefore, only do if the data is not there already
+if(file.exists('empirical_studies1000.RData')){
+  load('empirical_studies1000.RData')
+}else{
+
+  N_trials <- simulation_sampling_trials
+  madingley_jaccard_metrics <- get_madingley_metrics(N_trials, node.jaccard.aggregation , link_weight = simulation_attr_weight)
+  madingley_kmeans_metrics  <- get_madingley_metrics(N_trials, node.kmeans.aggregation , link_weight = simulation_attr_weight)
+  null_model_metrics        <- get_null_metrics(N_trials)
+  
+  save(madingley_jaccard_metrics, madingley_kmeans_metrics, null_model_metrics, file = 'empirical_studies1000.RData')
+  
+}
+
+# Getting means and standard deviation for all N_trials of each corresponding study
+jacc_mean_dt   <- rbindlist(lapply(madingley_jaccard_metrics, function(x) x[, lapply(.SD, mean)]), fill=TRUE)
+jacc_std_dt    <- rbindlist(lapply(madingley_jaccard_metrics, function(x) x[, lapply(.SD, sd)]), fill=TRUE)
+
+kmeans_mean_dt <- rbindlist(lapply(madingley_kmeans_metrics, function(x) x[, lapply(.SD, mean)]), fill=TRUE)
+kmeans_std_dt  <- rbindlist(lapply(madingley_kmeans_metrics, function(x) x[, lapply(.SD, sd)]), fill=TRUE)
+
+null_mean_dt   <- rbindlist(lapply(null_model_metrics, function(x) x[, lapply(.SD, sd)]), fill=TRUE)
+null_std_dt    <- rbindlist(lapply(null_model_metrics, function(x) x[, lapply(.SD, sd)]), fill=TRUE)
+```
+
+### Results
+
+Now we can create the plot function:
+
+```{r, message=FALSE, warning=FALSE}
+get_plot <- function(measure = "zscore", use_null = FALSE)
+{
+  if(measure == "zscore"){
+    y_name    <- "empirical food web value - mandingley average value"
+    jacc_dt   <- (empirical_metrics_dt - jacc_mean_dt) / jacc_std_dt
+    kmeans_dt <- (empirical_metrics_dt - kmeans_mean_dt) / kmeans_std_dt
+    null_dt   <- (empirical_metrics_dt - null_mean_dt) / null_std_dt
+    ylabel    <- TeX("$(x - \\mu) / \\sigma$")
+  }else if (measure == "difference"){
+    y_name    <- "empirical food web value - mandingley average value"
+    jacc_dt   <- (empirical_metrics_dt - jacc_mean_dt) 
+    kmeans_dt <- (empirical_metrics_dt - kmeans_mean_dt) 
+    null_dt   <- (empirical_metrics_dt - null_mean_dt)
+    ylabel    <- TeX("$(x - \\mu)$")
+  } else {# the other option is the ratio with respect to the Madingley networks
+    y_name    <- "(empirical food web value - mandingley average value) / madingley average value"
+    jacc_dt   <- (empirical_metrics_dt - jacc_mean_dt) / jacc_mean_dt
+    kmeans_dt <- (empirical_metrics_dt - kmeans_mean_dt) / kmeans_mean_dt
+    null_dt <- (empirical_metrics_dt - null_mean_dt) / null_mean_dt
+    ylabel    <-TeX("$(x - \\mu) / \\mu$")
+  }
+  
+  jacc_dt$connect      <- empirical_metrics_dt$connect
+  kmeans_dt$connect    <- empirical_metrics_dt$connect
+  null_dt$connect      <- empirical_metrics_dt$connect
+  jacc_dt$agg_method   <- 'Jaccard Trophic Similarity'
+  kmeans_dt$agg_method <- 'Mass A/J K-means'
+  null_dt$agg_method   <- 'Null Model'
+  
+  if(use_null == TRUE){
+    mean_dt <- rbind(jacc_dt,kmeans_dt,null_dt)  
+  }else{
+    mean_dt <- rbind(jacc_dt,kmeans_dt)
+  }
+  
+  labels <- c("connectance", "agg_method", "basal species","intermediate species","top species","generality","vulnerability",
+              "mean path length", "mean trophic level", "mean omnivory index",
+              "modularity", "clustering")
+  
+  variables <- c("connect","agg_method", "basal","int","top","gen","vul",
+              "mean.pl", "mean.tl", "mean.oi",
+              "le.mod", "transglobal")
+  
+  mean_dt <- mean_dt[,variables,with=FALSE]
+  
+  colnames(mean_dt) <- labels
+  
+  mean_dt_melted <- melt(mean_dt, id = c("connectance","agg_method"), measure = labels[3:12])
+  
+  
+  
+  q <- qplot(data=mean_dt_melted, x=connectance, y=value, log='x', size=I(2),
+            shape=agg_method, group = agg_method, color = agg_method) +
+       facet_wrap(~variable, scales = "free_y", ncol=2) +
+       labs(y = ylabel, x = TeX("S / L^2")) +
+       geom_hline(aes(yintercept = 0),colour='red',linetype=2,size=1) +
+       theme_bw() +
+       theme(legend.title=element_blank()) +
+       theme(axis.text=element_text(size=8),axis.title=element_text(size=12)) +
+       theme(legend.position="top") 
+  
+  return(q)
+  
+}
+```
+
+We can now plot the comparison, using two different comparison values. In all of them $x$ represents metric value in the empirical study, $\mu$ the mean of the metric value on the Madingley aggregated sampled foodwebs, and $\sigma$ the standard deviation of these foodwebs.:
+
+
+#### Difference
+
+```{r, message=FALSE, warning=FALSE, fig.height = 14, fig.width = 9, fig.align = "center"}
+
+q <- get_plot(measure="difference", use_null = simulation_use_null_model)
+
+pdf("figure05_empirical_abs_difference.pdf", width = 9, height = 12) # Open a new pdf file
+q
+dev.off()
+
+q
+```
+
+#### Z-score
+
+```{r, message=FALSE, warning=FALSE, fig.height = 14, fig.width = 9, fig.align = "center"}
+
+q <- get_plot(measure="zscore", use_null = simulation_use_null_model)
+
+pdf("supplementary_figure05_empirical_zscore.pdf", width = 9, height = 12) # Open a new pdf file
+q
+dev.off()
+
+q
+```
+

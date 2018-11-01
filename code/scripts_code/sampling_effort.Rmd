@@ -1,0 +1,290 @@
+---
+title: "Degree distribution and sampling effort"
+output:
+  html_document:
+    df_print: paged
+---
+
+This R notebook represents a script for studying the foodweb degree distribution depencenty on sampling effort. As usual, let's load the appropiate libraries:
+
+```{r, message=FALSE, warning=FALSE}
+# Loading packages
+library(igraph) # R famous graph library
+library(data.table) # A really fast data frame
+library(ggplot2) # Nice plots in R
+library(gridExtra) 
+library(NetIndices)
+library(parallel)
+library(latex2exp)
+
+# Loading Mandingley reading functions
+source('../main_code/network_reading.R')
+source('../main_code/network_aggregation.R')
+source('../main_code/network_sampling.R')
+source('../main_code/network_functions.R')
+source('../main_code/misc.R')
+
+# Loading Mandingley reading functions
+source('../main_code/network_reading.R')
+source('../main_code/network_aggregation.R')
+source('../main_code/network_sampling.R')
+source('../main_code/network_functions.R')
+source('../main_code/misc.R')
+```
+
+The followin represents the main parameters of the simulation
+
+```{r}
+# Link attribute to be used as the weight in the network to perform the poisson sampling
+simulation_attr_weight = "biomass.flow"
+
+# Parameters for the degree distributions
+simulation_S_degree             <- 200  # Number of aggregated cohorts
+simulation_time_snapshot_degree <- 1223 # Time snapshot for degree distribution
+simulation_tau_vals_degree      <- sapply(seq(1,9), function(x) 0.0000000001*10^x) # poisson parameter
+
+# Parameters for the matrix visualizations
+simulation_S_matrix             <- 60   # Number of aggregated cohorts
+simulation_time_snapshot_matrix <- 1200 # Time snapshot
+simulation_tau_vals_matrix      <- sapply(seq(1,6), function(x) 0.000000000001*100^x) # poisson parameter
+```
+
+
+
+### Loading Madingley data
+Let's continue by loading the full Madingley network at different time steps (an snapshot of the simulation), from 1200 to 1223 (around ~1000 time steps are required for the simulation to become stable):
+
+```{r, message=FALSE, warning=FALSE, results='hide'}
+node_file <- '../../data/madingley_data/original_nodes.txt'
+edge_file <- '../../data/madingley_data/original_edges.txt'
+
+# For this analysis, let's just focus in two snapshots
+snapshot_times <- c(simulation_time_snapshot_degree,simulation_time_snapshot_matrix)
+
+# Getting two madingley objects, one for each snapshot
+madingley_full_objects <- lapply(snapshot_times,  read.madingley.data, file_nodes=node_file, file_edges=edge_file, include_source_node = FALSE)
+```
+
+
+### Expectation of the degree distribution
+
+For this part we will generate CDF plots of the degree distribution after cohort aggregation and link sampling is performed. The more important aspect of this analysis is the impact of the sampling effort ($\tau$) on the degree distributon. Furthermore, a comparison between the two cohort aggregation methods will be also shown.
+
+#### Cohort aggregation
+
+As usual, we should start by extracting the aggregated versions. For this part we will created an aggregation for each method to create an aggregated food web of $S = `r simulation_S_degree`$
+
+```{r}
+
+S <- simulation_S_degree
+
+# First snapshot corresponds to the one that will be used for degree distribution analysis
+madingley_object <- madingley_full_objects[[1]]
+
+kmeans_agg_graph_degree  <- cohort.aggregation(madingley_object, S, node.kmeans.aggregation)@G
+jaccard_agg_graph_degree <- cohort.aggregation(madingley_object, S, node.jaccard.aggregation)@G
+```
+
+#### Link sampling
+
+For this part, we will extract degree distribution expectation of a graph based on the sampling effort $\tau$ (see main document for details). The next function will help us to extract such distribution:
+
+```{r}
+
+get_expected_degree_distribution <- function(tau, G, link_attr){
+  probability_matrix <- sampling.poisson.effort.prob_matrix(tau, G, link_attr)
+  expected_degrees   <- round(apply(probability_matrix, 1, sum) + apply(probability_matrix, 2, sum))
+  dt <- data.table(degree = expected_degrees)
+  dt <- dt[,.N,by=degree]
+  dt <- dt[order(-degree),]
+  dt$tau <- tau
+  return(data.table(degree=dt$degree, cdf=cumsum(dt$N)/sum(dt$N), tau=factor(tau)))
+}
+
+```
+
+We can now generate the data for our analysis.
+
+```{r}
+taus <- simulation_tau_vals_degree
+
+# extracting the probabilities
+dt_kmeans  <- rbindlist(lapply(taus, get_expected_degree_distribution, kmeans_agg_graph_degree, simulation_attr_weight))
+dt_jaccard <- rbindlist(lapply(taus, get_expected_degree_distribution, jaccard_agg_graph_degree, simulation_attr_weight))
+
+# One analysis without aggregation
+dt_madingley <- rbindlist(lapply(taus, get_expected_degree_distribution,  madingley_full_objects[[1]]@G, simulation_attr_weight))
+
+dt_kmeans$agg_method  <- 'Mass A/J K-means'
+dt_jaccard$agg_method <- 'Jaccard Trophic Similarity'
+
+dt_aggregation = rbind(dt_kmeans, dt_jaccard)
+
+```
+
+The following plot show the effect of sampling on the full Madingley food web without prior aggregation:
+
+```{r,  message=FALSE, warning=FALSE, fig.height = 8, fig.width = 8}
+q <-qplot(data=dt_madingley, x=degree, y=cdf, log='y', size=I(2)) + 
+  facet_wrap(~tau, scales = "free",  labeller = label_both) +
+  theme(axis.text=element_text(size=8),axis.title=element_text(size=12)) +
+  theme_bw() 
+
+pdf("supplementary_figure04_full_degree_dist.pdf", width = 8, height = 8) # Open a new pdf file
+q
+dev.off()
+q
+```
+
+The next figure shows the degree distribution for the two cohort aggregation methods for $S = `r simulation_S_degree$:
+
+```{r,  message=FALSE, warning=FALSE, fig.height = 8, fig.width = 8}
+q <- qplot(data=dt_aggregation, x=degree, y=cdf, log='y', size=I(2),
+          shape=agg_method, group = agg_method, color = agg_method) +
+     facet_wrap(~tau, scales = "free",  labeller = label_both) +
+     theme_bw() +
+     theme(legend.title=element_blank()) +
+     theme(axis.text=element_text(size=8),axis.title=element_text(size=12)) +
+     theme(legend.position="top") 
+
+pdf("figure03_agg_degree_dist.pdf", width = 8, height = 8) # Open a new pdf file
+q
+dev.off()
+
+q
+```
+
+### Food web sampling matrices
+
+In this part we will create visualizations of the adjacency matrices for the Madingley aggregated
+sampling food webs.
+
+#### Cohort aggregation
+
+As usual, we should start by extracting the aggregated versions. For this part we will created an aggregation for each method to create an aggregated food web of $S = `r simulation_S_matrix`$
+
+```{r}
+
+S <- simulation_S_matrix
+#S <- 80
+
+# First snapshot corresponds to the one that will be used for adjacency matrix visualization
+madingley_object_matrix <- madingley_full_objects[[2]]
+
+aggregated_kmeans       <- cohort.aggregation(madingley_object_matrix, S, node.kmeans.aggregation)
+aggregated_jaccard      <- cohort.aggregation(madingley_object_matrix, S, node.jaccard.aggregation)
+
+aggregated_kmeans_G     <- aggregated_kmeans@G
+aggregated_jaccard_G    <- aggregated_jaccard@G
+
+```
+
+We can now create a helper function to extract an adjacency probability matrix based in $\tau$ and othe properties:
+
+```{r}
+
+get_adjacency_probabilities <- function(tau, G, link_attr, sort_idx){
+  
+  matrix <- as.matrix(sampling.poisson.effort.prob_matrix(tau,G,link_attr))
+  nrows  <- nrow(matrix)
+  
+  # reversing in rows, as plotting in y in the reverse of the matrix row index
+  matrix <- matrix[rev(sort_idx), sort_idx]
+  
+  # melt fuction use row/column keys for creating the data frame
+  rownames(matrix) <- 1:nrows
+  colnames(matrix) <- 1:nrows
+  
+  # adjacency matrix a table (input for heatmap)
+  df <- melt(matrix)
+  colnames(df) <- c("prey", "predator", "sampling probability")
+  df$tau <- tau
+  
+  return(df)
+}
+
+```
+
+Now, we can extract the data that we need in order to create the visualization of the adjacency matrices:
+
+```{r}
+
+taus      <- simulation_tau_vals_matrix
+link_attr <- simulation_attr_weight
+
+# sort indexing for the adjacency matrix
+idx_kmeans    <- sort(vertex_attr(aggregated_kmeans_G, 'M'), index.return=TRUE)$ix
+idx_jaccard   <- sort(vertex_attr(aggregated_jaccard_G, 'M'), index.return=TRUE)$ix
+idx_madingley <- sort(vertex_attr(madingley_object_matrix@G, 'M'), index.return=TRUE)$ix
+
+# extracting the probabilities
+dt_kmeans_matrix  <- rbindlist(lapply(taus, get_adjacency_probabilities, aggregated_kmeans_G, link_attr, idx_kmeans))
+dt_jaccard_matrix <- rbindlist(lapply(taus, get_adjacency_probabilities, aggregated_jaccard_G, link_attr, idx_jaccard))
+
+# One analysis without aggregation
+dt_madingley_matrix <- rbindlist(lapply(taus, get_adjacency_probabilities, madingley_object_matrix@G, link_attr, idx_madingley))
+```
+
+The next figure represent the sampling probability for the adjacency matrix of the Madingley food web without any cohort aggregation:
+
+```{r,  fig.height = 8, fig.width = 10}
+
+theme_matrix <- 
+  theme(aspect.ratio=1) + 
+  theme(panel.background = element_blank()) +
+  theme(axis.text.x = element_blank(),axis.text.y = element_blank(),axis.ticks = element_blank()) +
+  #theme(legend.title=element_blank()) +
+     theme(axis.text=element_text(size=8),axis.title=element_text(size=12)) +
+     theme(legend.position="top") 
+
+g<-ggplot(dt_madingley_matrix, aes(predator,prey, fill=`sampling probability`)) + 
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  geom_raster() +
+  facet_wrap(~tau, scales = "free",  labeller = label_both) +
+  theme_matrix
+
+pdf("supplementary_figure02_full_matrices.pdf", width = 8, height = 6) # Open a new pdf file
+g
+dev.off()
+
+
+print(g)
+```
+
+The next figure represent the sampling probability for the adjacency matrix after performing k-means cohort aggregation with $S=`r simulation_S_matrix`$:
+
+```{r,  fig.height = 8, fig.width = 10}
+g<-ggplot(dt_kmeans_matrix, aes(predator,prey, fill=`sampling probability`)) + 
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  geom_raster() +
+  facet_wrap(~tau, scales = "free",  labeller = label_both) +
+  theme_matrix
+
+pdf("figure02_kmeans_matrices.pdf", width = 8, height = 6) # Open a new pdf file
+g
+dev.off()
+
+
+print(g)
+
+```
+
+
+And finally the next figure represent the sampling probability for the adjacency matrix after performing Jaccart trophic similarity cohort aggregation with $S=`r simulation_S_matrix`$:
+
+```{r, fig.height = 8, fig.width = 10}
+g<-ggplot(dt_jaccard_matrix, aes(predator,prey, fill=`sampling probability`)) + 
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  geom_raster() +
+  facet_wrap(~tau, scales = "free",  labeller = label_both) +
+  theme_matrix
+
+pdf("supplementary_figure03_jaccard_matrices.pdf", width = 8, height = 6) # Open a new pdf file
+g
+dev.off()
+
+
+print(g)
+
+```
+

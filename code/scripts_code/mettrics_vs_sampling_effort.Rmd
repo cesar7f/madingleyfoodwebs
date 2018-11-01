@@ -1,0 +1,255 @@
+---
+title: "Network metrics dependency on link sampling effort"
+output:
+  html_document:
+    df_print: paged
+---
+
+In this R Notebook we will study how sampling effort affects the values of different network metrics for a specific size Madingley
+aggregated size. Let's start by importing useful libraries:
+```{r, message=FALSE, warning=FALSE}
+# Loading packages
+library(igraph) # R famous graph library
+library(data.table) # A really fast data frame
+library(ggplot2) # Nice plots in R
+library(gridExtra) 
+library(NetIndices)
+library(parallel)
+library(latex2exp)
+
+# Loading Mandingley reading functions
+source('../main_code/network_reading.R')
+source('../main_code/network_aggregation.R')
+source('../main_code/network_sampling.R')
+source('../main_code/network_functions.R')
+source('../main_code/misc.R')
+
+```
+
+The followin represents the main parameters of the simulation
+
+```{r, message=FALSE, warning=FALSE}
+# Number of nodes to perform cohort aggregation. 
+simulation_S           <- 100
+
+# Link attribute to be used as the weight in the network to perform the poisson sampling
+simulation_attr_weight <- "biomass.flow"
+
+# The number of different link sizes to plot (i.e. connectance)
+simulation_link_size   <- floor(sapply(seq(0,13), function(x) 20*1.5^x))
+
+# The number of trials for each different sampling link size
+simulation_trials      <- 1000
+
+# Plot null model data
+simulation_use_null_model       <- FALSE
+
+# Use parallelism (only possible in non windows computers)
+simulation_use_parallelism      <- FALSE
+simulation_cores                <- 6 # If previous value is TRUE
+
+# Just a simple function to make use of a paraller lapply when enabled
+sim_lapply <- function(...){
+  if(simulation_use_parallelism == TRUE){
+    mclapply(mc.cores = simulation_cores, mc.silent = FALSE, ...)
+  } else{
+    lapply(...)
+  }
+}
+
+set.seed(101) ## for reproducibility
+```
+
+
+### Loading Madingley data
+Let's continue by loading the full Madingley network at different time steps (an snapshot of the simulation), from 1200 to 1223 (around ~1000 time steps are required for the simulation to become stable):
+
+```{r,  message=FALSE, warning=FALSE, results='hide'}
+node_file <- '../../data/madingley_data/original_nodes.txt'
+edge_file <- '../../data/madingley_data/original_edges.txt'
+
+# 1200 to 1223
+madingley_times <- unique(fread(input=node_file, header = T, sep = '\t')$TimeStep)
+
+# Getting all mandingley objects (24 objects), each one representing a different time step and containing a different graph
+madingley_full_objects <- sim_lapply(madingley_times,  read.madingley.data, file_nodes=node_file, file_edges=edge_file, include_source_node = FALSE)
+```
+
+
+### Generating the cohort aggregation graphs
+
+Now we generate our initial set of cohort agrregations for each snapshot of the Madingley output. For this part we also need to decide, we need to fix the number of nodes to which the aggregation will be performed ($S$).
+
+```{r, cache=TRUE}
+
+S = simulation_S
+
+kmeans_snapshots_agg_graphs  <- sim_lapply(madingley_full_objects, function(x) cohort.aggregation(x, S, node.kmeans.aggregation)@G)
+jaccard_snapshots_agg_graphs <- sim_lapply(madingley_full_objects, function(x) cohort.aggregation(x, S, node.jaccard.aggregation)@G)
+```
+
+### Generating the sampling graphs
+
+Now for each different link size connectance, we will need to generate a set of different sampling networks according to the initial parameters. The main idea is that we will use any of the previous set of cohort aggregated graphs as the initial set to sample. The snapshot to be used will be chosen randomly with replacement:
+```{r}
+# A function to generate 'N_trials' sampled poisson graphs with 'L' links 
+# from a set of cohort aggregated graphs 'shapshot_agg_graphs'
+agg_sampling_effort_graphs <- function(L, snapshots_agg_graphs, N_trials = simulation_trials) {
+  
+  snapshot_index = sample.int(length(madingley_times), N_trials, replace = TRUE)
+  sample_graphs <- lapply(snapshot_index, 
+                          function(x) sampling.poisson(n_links_sampled = L, 
+                                                       G = snapshots_agg_graphs[[x]], 
+                                                       lambda_rate = simulation_attr_weight)
+  )
+  
+  return(sample_graphs)
+}
+```
+
+
+### Extracting the network metrics 
+
+Now we can create a function that will be used to extract all network metrics for the aggregated snapshots:
+```{r}
+# A function to generate some network metrics
+calculateMetrics <-function (g) 
+{
+  S <- vcount(g)
+  L <- ecount(g)
+  connect <- S/(L * L)
+  
+  clust = clusters(g,mode = "weak")
+  
+  mean.pl <-average.path.length(g, directed = F)
+  le.mod <- modularity(walktrap.community(g))
+  transglobal <- transitivity(g, type = 'global')
+  n.components = clust$no
+  large.component = max(clust$csize)
+  
+  variables = c("mean.pl", "le.mod", "transglobal", "n.components", "large.component")
+  
+  return(list(mean.pl = mean.pl, le.mod = le.mod, transglobal = transglobal,
+              n.components = n.components, large.component = large.component))
+}
+
+# A function to generate the expected network metrics
+get_sample_effort_network_metrics <- function(snapshots_agg_graphs, N_trials = simulation_trials)
+{
+  
+  # Creates a random graph with S nodes and L expected links. 
+  get_metric_summary <- function(L) {
+    print(paste("Calculating metrics for network:", L))
+    graphs <- agg_sampling_effort_graphs(L, snapshots_agg_graphs, N_trials)
+    metrics <- lapply(graphs,calculateMetrics)
+    metrics_dt <- rbindlist(metrics, fill=TRUE)
+    return(metrics_dt)
+  }
+  
+  metrics <- sim_lapply(simulation_link_size, get_metric_summary)
+  
+  return(metrics)
+}
+
+# metrics for a bernoulli null model
+get_null_metrics <- function(N_trials){
+   
+  i <- 0
+  get_metric_summary <- function(L) {
+    i <<- i+1
+    print(paste("Calculating metrics for network:", i))
+    graphs <- replicate(N_trials, list(null_bernoulli_graph(simulation_S, L)))
+    metrics <- lapply(graphs,calculateMetrics)
+    metrics_dt <- rbindlist(metrics, fill=TRUE)
+    return(metrics_dt)
+  }
+  
+  metrics <- sim_lapply(simulation_link_size, get_metric_summary) 
+  return(metrics)
+}
+```
+
+
+Using the previous function we can finally extract all network metrics for the Madingley aggregated sampled food webs. For this part, we will extract results for both methods of cohort aggregation: i) jaccard trophic similarity, and k-means mass aggregation:
+
+```{r, message=FALSE, warning=FALSE}
+
+# this part is very expensive, therefore, only do if the data is not there already
+if(file.exists('mettrics_vs_sampling_effort1000.RData')){
+  load('mettrics_vs_sampling_effort1000.RData')
+}else{
+  N_trials <- simulation_trials
+  jaccard_metrics    <- get_sample_effort_network_metrics(jaccard_snapshots_agg_graphs, N_trials)
+  kmeans_metrics     <- get_sample_effort_network_metrics(kmeans_snapshots_agg_graphs, N_trials)
+  null_model_metrics <- get_null_metrics(N_trials)
+  save(jaccard_metrics, kmeans_metrics, null_model_metrics, file = 'mettrics_vs_sampling_effort1000.RData')
+}
+
+# Getting means and standard deviation for all N_trials of each corresponding study
+jacc_metrics_mean_dt   <- rbindlist(lapply(jaccard_metrics, function(x) x[, lapply(.SD, mean, na.rm=TRUE)]), fill=TRUE)
+jacc_metrics_std_dt    <- rbindlist(lapply(jaccard_metrics, function(x) x[, lapply(.SD, sd, na.rm=TRUE)]), fill=TRUE)
+
+kmeans_metrics_mean_dt <- rbindlist(lapply(kmeans_metrics, function(x) x[, lapply(.SD, mean, na.rm=TRUE)]), fill=TRUE)
+kmeans_metrics_std_dt  <- rbindlist(lapply(kmeans_metrics, function(x) x[, lapply(.SD, sd, na.rm=TRUE)]), fill=TRUE)
+
+null_mean_dt           <- rbindlist(lapply(null_model_metrics, function(x) x[, lapply(.SD, sd)]), fill=TRUE)
+null_std_dt            <- rbindlist(lapply(null_model_metrics, function(x) x[, lapply(.SD, sd)]), fill=TRUE)
+```
+
+### Results
+
+Before plotting the results, we need to create some functions that will give style 
+
+### Results
+
+Now we can create the plot function:
+
+```{r, message=FALSE, warning=FALSE}
+get_plot <- function(use_null = FALSE)
+{
+  connectance <- simulation_link_size/(simulation_S*simulation_S)
+  
+  jacc_metrics_mean_dt$connect      <- connectance
+  kmeans_metrics_mean_dt$connect    <- connectance
+  null_mean_dt$connect              <- connectance
+  jacc_metrics_mean_dt$agg_method   <- 'Jaccard Trophic Similarity'
+  kmeans_metrics_mean_dt$agg_method <- 'Mass A/J K-means'
+  null_mean_dt$agg_method           <- 'Null Model'
+  
+  if(use_null == TRUE){
+    mean_dt <- rbind(jacc_metrics_mean_dt,kmeans_metrics_mean_dt,null_mean_dt)  
+  }else{
+    mean_dt <- rbind(jacc_metrics_mean_dt,kmeans_metrics_mean_dt)
+  }
+
+  labels = c("connectance", "agg_method","number of components", "average path length", "modularity", "clustering")
+  variables = c("connect","agg_method", "n.components", "mean.pl", "le.mod", "transglobal")
+  
+  mean_dt <- mean_dt[,variables,with=FALSE]
+  
+  colnames(mean_dt) <- labels
+  
+  mean_dt_melted <- melt(mean_dt, id = c("connectance","agg_method"), measure = labels[3:6])
+  
+  q <- qplot(data=mean_dt_melted, x=connectance, y=value, log='x', size=I(2),
+            shape=agg_method, group = agg_method, color = agg_method) +
+       facet_wrap(~variable, scales = "free_y", ncol=2) +
+       labs(y = "metric value", x = TeX("S / L^2")) +
+       theme_bw() +
+       theme(legend.title=element_blank()) +
+       theme(axis.text=element_text(size=8),axis.title=element_text(size=12)) +
+       theme(legend.position="top") 
+  
+  return(q)
+  
+}
+```
+Now we can see how a different set of metrics changes according to the connectance for the two set of aggregated methods in the following figure.
+
+```{r, message=FALSE, warning=FALSE, fig.height = 6, fig.width = 10, fig.align = "center"}
+q<-get_plot(use_null = simulation_use_null_model)
+pdf("figure04_metrics.pdf", width = 10, height = 6) # Open a new pdf file
+q
+dev.off()
+q
+```
