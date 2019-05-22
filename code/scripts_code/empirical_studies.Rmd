@@ -250,7 +250,7 @@ get_plot <- function(measure = "zscore", use_null = FALSE)
   q <- qplot(data=mean_dt_melted, x=connectance, y=value, log='x', size=I(2),
             shape=agg_method, group = agg_method, color = agg_method) +
        facet_wrap(~variable, scales = "free_y", ncol=2) +
-       labs(y = ylabel, x = TeX("S / L^2")) +
+       labs(y = ylabel, x = TeX("L / S^2")) +
        geom_hline(aes(yintercept = 0),colour='red',linetype=2,size=1) +
        theme_bw() +
        theme(legend.title=element_blank()) +
